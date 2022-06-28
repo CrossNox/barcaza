@@ -52,6 +52,7 @@ class RPCError(Exception):
 
 class ServerComms:
     def __init__(self, timeout, port):
+        self.timeout = (random.random() + 1) * timeout
         self.assign_random_timeout(timeout)
         self.port = port
 
@@ -81,9 +82,6 @@ class ServerComms:
 
     def send_rpc(self, rpc):
         self.send_string(rpc.to_json())
-
-    def assign_random_timeout(self, timeout):
-        self.timeout = (random.random() + 1) * timeout
 
     @property
     def npeers(self):
@@ -159,6 +157,20 @@ class AppendEntries:
         return AppendEntries(**parsed_result)
 
 
+@dataclass
+class AppendEntriesResult:
+    term: int
+    success: bool
+
+    def to_json(self):
+        return json.dumps({"term": self.term, "success": self.success})
+
+    @classmethod
+    def from_json(cls, jsonstring):
+        parsed_result = json.loads(jsonstring)
+        return AppendEntriesResult(**parsed_result)
+
+
 @abc.ABC
 class Status:
     def __init__(self, identifier: str, status: ServerStatus, comms: ServerComms):
@@ -184,6 +196,14 @@ class Status:
         self._step()
 
 
+class AppendEntryFromNewLeader(Exception):
+    pass
+
+
+class ElectionTimeout(Exception):
+    pass
+
+
 class Follower(Status):
     def handle_heartbeat(self, heartbeat):
         raise NotImplementedError()
@@ -200,14 +220,6 @@ class Follower(Status):
                 raise
             # Timed out, start election
             return self.transition(Candidate)
-
-
-class AppendEntryFromNewLeader(Exception):
-    pass
-
-
-class ElectionTimeout(Exception):
-    pass
 
 
 class Candidate(Status):
@@ -241,8 +253,19 @@ class Leader(Status):
     def __init__(self, just_elected: bool = True):
         self.just_elected = just_elected
 
-    def send_heartbeats(self):
-        pass
+    async def send_heartbeats(self):
+        heartbeats = [
+            peer.send_append_entry(
+                term=self.status.term,
+                leader_id=self.identifier,
+                prev_log_entry=self.status.last_log_entry,
+                leader_commit=self.status.commit_index,
+                entries=[],
+            )
+            for peer in self.comms.peers
+        ]
+        heartbeats_results = await asyncio.gather(*heartbeats)
+        return heartbeats_results
 
     def apply(self, entry):
         # append entry to local log
@@ -262,6 +285,7 @@ class Leader(Status):
         if self.just_elected:
             self.send_heartbeats()
 
+        self.just_elected = False
         try:
             entry = self.comms.recv_string()
             self.apply(entry)
@@ -292,8 +316,22 @@ class Peer:
         req_vote = RequestVote(identifier, term, last_log_entry)
         await self.socket.send_string(req_vote.to_json())
         response = await self.socket.recv_string()
-        vote_res = VoteResult.from_json(response)
-        return vote_res
+        return VoteResult.from_json(response)
+
+    async def send_append_entry(
+        self,
+        term: int,
+        leader_id: str,
+        prev_log_entry: LogEntry,
+        leader_commit: int,
+        entries: List[str] = [],
+    ) -> AppendEntriesResult:
+        append_entry = AppendEntries(
+            term, leader_id, prev_log_entry, entries, leader_commit
+        )
+        await self.socket.send_string(append_entry.to_json())
+        response = await self.socket.recv_string()
+        return AppendEntriesResult.from_json(response)
 
 
 @dataclass
